@@ -25,6 +25,7 @@ public class Contract {
     private Double partialTruckRate;
     private Integer maxDaysForLogistics;
 
+
     // Getters and Setters
 }
 

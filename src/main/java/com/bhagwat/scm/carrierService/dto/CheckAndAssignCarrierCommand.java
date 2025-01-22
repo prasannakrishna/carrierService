@@ -13,6 +13,9 @@ public class CheckAndAssignCarrierCommand {
     private String shipmentId;
     private CarrierRequestObject requestObject;
 
+    public CheckAndAssignCarrierCommand(String shipmentId, String carrierId, String status) {
+    }
+
     // Constructor, Getters, and Setters
 }
 

@@ -63,7 +63,7 @@ public class TaskLockingService {
         writeActivityLog(operatorId, facilityId, "task-claim", "task", taskId,
                 Map.of("action", "claim"), "SUCCESS", sessionId);
 
-        return ClaimResult.success();
+        return ClaimResult.claimed();
     }
 
     /**
@@ -191,7 +191,7 @@ public class TaskLockingService {
 
     // Result types
     public record ClaimResult(boolean success, UUID lockedTo, Instant lockedAt) {
-        public static ClaimResult success() { return new ClaimResult(true, null, null); }
+        public static ClaimResult claimed() { return new ClaimResult(true, null, null); }
         public static ClaimResult locked(UUID lockedTo, Instant lockedAt) { return new ClaimResult(false, lockedTo, lockedAt); }
     }
 

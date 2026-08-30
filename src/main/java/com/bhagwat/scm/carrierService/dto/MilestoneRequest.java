@@ -15,4 +15,5 @@ public class MilestoneRequest {
     private BigDecimal longitude;
     private String notes;
     private String postedBy;
+    private String idempotencyKey;
 }

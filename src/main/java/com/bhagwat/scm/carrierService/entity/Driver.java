@@ -19,6 +19,8 @@ public class Driver {
     private String fleetId;
     @Column(name = "status", length = 30)
     private String status;
+    @Column(name = "pin_hash", length = 255)
+    private String pinHash;
     @Column(name = "created_at")
     private Instant createdAt;
 

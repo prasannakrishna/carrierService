@@ -4,6 +4,7 @@ import com.bhagwat.scm.carrierService.entity.*;
 import com.bhagwat.scm.carrierService.repository.*;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
+import org.springframework.security.crypto.bcrypt.BCryptPasswordEncoder;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -21,10 +22,13 @@ public class LogisticsMaintenanceController {
     private final PartyRepository partyRepo;
     private final SiteRepository siteRepo;
 
+    private final BCryptPasswordEncoder pinEncoder = new BCryptPasswordEncoder(10);
+
     // ── Drivers ──
     @PostMapping("/drivers")
     public ResponseEntity<Driver> createDriver(@RequestBody Driver d) {
         if (d.getDriverId() == null) d.setDriverId("DRV-" + UUID.randomUUID().toString().substring(0, 8).toUpperCase());
+        d.setPinHash(null); // PIN is set separately via /drivers/{id}/pin, never accepted as raw hash here
         return ResponseEntity.ok(driverRepo.save(d));
     }
     @GetMapping("/drivers")
@@ -32,9 +36,28 @@ public class LogisticsMaintenanceController {
     @GetMapping("/drivers/{id}")
     public ResponseEntity<Driver> getDriver(@PathVariable String id) { return ResponseEntity.ok(driverRepo.findById(id).orElseThrow()); }
     @PutMapping("/drivers/{id}")
-    public ResponseEntity<Driver> updateDriver(@PathVariable String id, @RequestBody Driver d) { d.setDriverId(id); return ResponseEntity.ok(driverRepo.save(d)); }
+    public ResponseEntity<Driver> updateDriver(@PathVariable String id, @RequestBody Driver d) {
+        d.setDriverId(id);
+        // Preserve the existing PIN hash — this endpoint updates driver profile fields,
+        // not credentials; PIN rotation goes through /drivers/{id}/pin.
+        driverRepo.findById(id).ifPresent(existing -> d.setPinHash(existing.getPinHash()));
+        return ResponseEntity.ok(driverRepo.save(d));
+    }
     @DeleteMapping("/drivers/{id}")
     public ResponseEntity<Void> deleteDriver(@PathVariable String id) { driverRepo.deleteById(id); return ResponseEntity.noContent().build(); }
+
+    /** Sets (or rotates) a driver's login PIN for carrier-driver-app. Hashed server-side — never stored or accepted as plaintext/hash from elsewhere. */
+    @PatchMapping("/drivers/{id}/pin")
+    public ResponseEntity<Void> setDriverPin(@PathVariable String id, @RequestBody DriverPinRequest request) {
+        Driver driver = driverRepo.findById(id).orElseThrow(() -> new java.util.NoSuchElementException("Driver not found: " + id));
+        driver.setPinHash(pinEncoder.encode(request.getPin()));
+        driverRepo.save(driver);
+        return ResponseEntity.noContent().build();
+    }
+
+    public record DriverPinRequest(String pin) {
+        public String getPin() { return pin; }
+    }
 
     // ── Fleets ──
     @PostMapping("/fleets")

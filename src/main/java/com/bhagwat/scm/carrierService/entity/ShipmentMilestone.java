@@ -38,6 +38,9 @@ public class ShipmentMilestone {
     @Column(name = "posted_by", length = 255)
     private String postedBy;
 
+    @Column(name = "idempotency_key", length = 100)
+    private String idempotencyKey;
+
     @Column(name = "created_at", nullable = false, updatable = false)
     private LocalDateTime createdAt;
 

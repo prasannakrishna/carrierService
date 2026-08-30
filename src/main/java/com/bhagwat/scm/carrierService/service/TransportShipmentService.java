@@ -20,6 +20,7 @@ public class TransportShipmentService {
     private final TransportShipmentRepository shipmentRepository;
     private final ShipmentMilestoneRepository milestoneRepository;
     private final ReadyToShipOrderRepository rtsRepository;
+    private final ConsignmentRepository consignmentRepository;
     private final CarrierKafkaProducer kafkaProducer;
 
     // ── Queries ──────────────────────────────────────────────────────────────
@@ -49,6 +50,13 @@ public class TransportShipmentService {
 
     @Transactional
     public MilestoneResponse postMilestone(MilestoneRequest req) {
+        if (req.getIdempotencyKey() != null) {
+            var existing = milestoneRepository.findByIdempotencyKey(req.getIdempotencyKey());
+            if (existing.isPresent()) {
+                return toMilestoneResponse(existing.get());
+            }
+        }
+
         TransportShipment ts = findShipment(req.getTsId());
 
         ShipmentMilestone milestone = ShipmentMilestone.builder()
@@ -60,6 +68,7 @@ public class TransportShipmentService {
                 .longitude(req.getLongitude())
                 .notes(req.getNotes())
                 .postedBy(req.getPostedBy())
+                .idempotencyKey(req.getIdempotencyKey())
                 .build();
 
         milestoneRepository.save(milestone);
@@ -139,6 +148,25 @@ public class TransportShipmentService {
                 .build();
 
         TransportShipment saved = shipmentRepository.save(ts);
+
+        // Every shipment has at least one destination-level consignment. The live
+        // transport-planning path only ever produces DIRECT plans today (single
+        // origin, single destination), so one consignment per shipment matches
+        // actual current behavior; SOURCE/DEST_CONSOLIDATION would add more here
+        // once the planner's plan-type selection is wired into the live path.
+        Consignment consignment = Consignment.builder()
+                .transportShipmentId(saved.getTsId())
+                .orderId((String) event.get("orderId"))
+                .destinationType(dest != null && dest.getLocationId() != null ? "PARTY" : "UNKNOWN")
+                .destinationId(saved.getConsignee() != null && saved.getConsignee().getPartyId() != null
+                        ? saved.getConsignee().getPartyId() : "unknown")
+                .destinationName(saved.getConsignee() != null ? saved.getConsignee().getPartyName() : null)
+                .labelCode("CNG-" + java.util.UUID.randomUUID().toString().substring(0, 8).toUpperCase())
+                .totalPackages(saved.getTotalPackages())
+                .totalWeightKg(saved.getTotalWeightKg())
+                .build();
+        consignmentRepository.save(consignment);
+
         return saved.getTsId();
     }
 

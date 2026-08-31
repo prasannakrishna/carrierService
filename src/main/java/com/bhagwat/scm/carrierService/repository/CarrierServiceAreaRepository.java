@@ -34,4 +34,8 @@ public interface CarrierServiceAreaRepository extends JpaRepository<CarrierServi
 
     /** Find carriers by city */
     List<CarrierServiceArea> findByCityAndServiceTypeAndActiveTrue(String city, ServiceType serviceType);
+
+    /** Does this specific carrier already cover this cluster with one of the given service types? */
+    boolean existsByCarrierIdAndClusterPrefixAndServiceTypeInAndActiveTrue(
+            String carrierId, String clusterPrefix, List<ServiceType> serviceTypes);
 }

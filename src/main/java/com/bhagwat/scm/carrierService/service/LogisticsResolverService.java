@@ -201,6 +201,47 @@ public class LogisticsResolverService {
     }
 
     /**
+     * Verifies whether a SPECIFIC carrier (the one already assigned to a
+     * transport plan leg) actually covers a given pincode for the leg's
+     * role — as opposed to resolveRoute(), which always picks whichever
+     * carrier is best regardless of who's already been assigned. If the
+     * assigned carrier isn't actually capable, returns a substitute if one
+     * is registered for that pincode/role.
+     *
+     * @param role "PICKUP" (checks FIRST_MILE/FULL_SERVICE) or "DELIVERY" (checks LAST_MILE/FULL_SERVICE)
+     */
+    @Transactional(readOnly = true)
+    public CapabilityCheck verifyCapability(String carrierId, String pincode, String role) {
+        String cluster = pincode != null && pincode.length() >= 3 ? pincode.substring(0, 3) : pincode;
+        List<ServiceType> validTypes = "PICKUP".equalsIgnoreCase(role)
+                ? List.of(ServiceType.FIRST_MILE, ServiceType.FULL_SERVICE)
+                : List.of(ServiceType.LAST_MILE, ServiceType.FULL_SERVICE);
+
+        boolean capable = serviceAreaRepo.existsByCarrierIdAndClusterPrefixAndServiceTypeInAndActiveTrue(
+                carrierId, cluster, validTypes);
+
+        if (capable) {
+            return CapabilityCheck.builder().capable(true).build();
+        }
+
+        List<CarrierServiceArea> candidates = serviceAreaRepo
+                .findByClusterPrefixAndServiceTypeInAndActiveTrue(cluster, validTypes);
+        if (candidates.isEmpty()) {
+            log.warn("Carrier {} not {}-capable for cluster {}, and no substitute registered", carrierId, role, cluster);
+            return CapabilityCheck.builder().capable(false).build();
+        }
+
+        CarrierServiceArea substitute = selectBestCarrier(candidates);
+        log.info("Carrier {} not {}-capable for cluster {} — substitute {} found",
+                carrierId, role, cluster, substitute.getCarrierId());
+        return CapabilityCheck.builder()
+                .capable(false)
+                .substituteCarrierId(substitute.getCarrierId())
+                .substituteCarrierName(substitute.getCarrierName())
+                .build();
+    }
+
+    /**
      * Select the best carrier from a list — cheapest rate, then fastest.
      */
     private CarrierServiceArea selectBestCarrier(List<CarrierServiceArea> carriers) {
@@ -222,6 +263,14 @@ public class LogisticsResolverService {
         private Integer estimatedDays;
         private String message;
         private List<ShipmentLeg> legs;
+    }
+
+    @Data
+    @Builder
+    public static class CapabilityCheck {
+        private boolean capable;
+        private String substituteCarrierId;
+        private String substituteCarrierName;
     }
 
     @Data

@@ -3,6 +3,7 @@ package com.bhagwat.scm.carrierService.controller;
 import com.bhagwat.scm.carrierService.entity.CarrierServiceArea;
 import com.bhagwat.scm.carrierService.repository.CarrierServiceAreaRepository;
 import com.bhagwat.scm.carrierService.service.LogisticsResolverService;
+import com.bhagwat.scm.carrierService.service.LogisticsResolverService.CapabilityCheck;
 import com.bhagwat.scm.carrierService.service.LogisticsResolverService.ShipmentPlan;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
@@ -74,6 +75,21 @@ public class LogisticsResolverController {
     public ResponseEntity<List<CarrierServiceArea>> findFirstMile(@RequestParam String cluster) {
         return ResponseEntity.ok(serviceAreaRepo.findByClusterPrefixAndServiceTypeInAndActiveTrue(
                 cluster, List.of(CarrierServiceArea.ServiceType.FIRST_MILE, CarrierServiceArea.ServiceType.FULL_SERVICE)));
+    }
+
+    /**
+     * Verify whether an already-assigned carrier actually covers a pincode
+     * for a given leg role, and get a substitute if they don't.
+     *
+     * GET /api/v1/logistics/verify-capability?carrierId=X&pincode=560043&role=PICKUP
+     * role: PICKUP (first-mile) or DELIVERY (last-mile)
+     */
+    @GetMapping("/verify-capability")
+    public ResponseEntity<CapabilityCheck> verifyCapability(
+            @RequestParam String carrierId,
+            @RequestParam String pincode,
+            @RequestParam String role) {
+        return ResponseEntity.ok(resolverService.verifyCapability(carrierId, pincode, role));
     }
 
     /**

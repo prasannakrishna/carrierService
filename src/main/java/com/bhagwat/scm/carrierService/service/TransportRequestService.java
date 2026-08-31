@@ -98,7 +98,11 @@ public class TransportRequestService {
         ).collect(Collectors.toList());
         rtsItemRepo.saveAll(rtsItems);
 
-        // Create ASN for destination party (consignee)
+        // Prepare (but do not send) the ASN for the destination party. It's only
+        // actually sent once the carrier picks up the shipment — see
+        // TransportShipmentService.postMilestone(), which flips this to SENT on
+        // the PICKED milestone. Previously this fired at booking time, well
+        // before the shipment had actually moved.
         AdvancedShipmentNotice asn = AdvancedShipmentNotice.builder()
                 .asnNumber(asnNumber())
                 .rtsId(savedRts.getRtsId()).rtsNumber(savedRts.getRtsNumber())
@@ -112,13 +116,8 @@ public class TransportRequestService {
                 .expectedArrivalDate(tr.getRequestedDeliveryDate())
                 .totalWeightKg(tr.getTotalWeightKg()).totalVolumeM3(tr.getTotalVolumeM3())
                 .totalPackages(tr.getTotalPackages())
-                .status(AsnStatus.SENT).sentAt(LocalDateTime.now()).build();
+                .status(AsnStatus.DRAFT).build();
         AdvancedShipmentNotice savedAsn = asnRepo.save(asn);
-
-        // Mark RTS asn sent
-        savedRts.setAsnSent(true);
-        savedRts.setAsnSentAt(LocalDateTime.now());
-        rtsRepo.save(savedRts);
 
         // Create Transport Shipment
         TransportShipment ts = TransportShipment.builder()
@@ -151,7 +150,10 @@ public class TransportRequestService {
                 "originCity", tr.getOriginAddress() != null && tr.getOriginAddress().getCity() != null ? tr.getOriginAddress().getCity() : "",
                 "destinationCity", tr.getDestinationAddress() != null && tr.getDestinationAddress().getCity() != null ? tr.getDestinationAddress().getCity() : ""
         ));
-        producer.publishAsnSent(savedAsn.getAsnId(), Map.of("asnId", savedAsn.getAsnId(), "rtsId", savedRts.getRtsId()));
+        // ASN is sent (and transport.asn.sent published — this is also what
+        // triggers workflowService's packing/grading orchestration) once the
+        // carrier actually picks up the shipment, not here at booking time.
+        // See TransportShipmentService.postMilestone().
 
         return toRtsResponse(savedRts, rtsItems);
     }

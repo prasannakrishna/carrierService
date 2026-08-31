@@ -21,6 +21,7 @@ public class TransportShipmentService {
     private final ShipmentMilestoneRepository milestoneRepository;
     private final ReadyToShipOrderRepository rtsRepository;
     private final ConsignmentRepository consignmentRepository;
+    private final AdvancedShipmentNoticeRepository asnRepository;
     private final CarrierKafkaProducer kafkaProducer;
 
     // ── Queries ──────────────────────────────────────────────────────────────
@@ -79,6 +80,7 @@ public class TransportShipmentService {
             ts.setStatus(newStatus);
             if (newStatus == TransportShipmentStatus.PICKED) {
                 ts.setActualPickupDateTime(req.getMilestoneDateTime());
+                sendAsnOnPickup(ts);
             } else if (newStatus == TransportShipmentStatus.DELIVERED) {
                 ts.setActualDeliveryDateTime(req.getMilestoneDateTime());
                 kafkaProducer.publishShipmentDelivered(ts.getTsId(), java.util.Map.of("tsId", ts.getTsId(), "rtsId", ts.getRtsId(), "carrierId", ts.getCarrierId()));
@@ -230,6 +232,32 @@ public class TransportShipmentService {
     }
 
     // ── Helpers ───────────────────────────────────────────────────────────────
+
+    /**
+     * ASN is created (as DRAFT) at RTS booking time but only actually sent to
+     * the consignee once the carrier picks up the shipment — see
+     * TransportRequestService.createRts(). This also publishes
+     * transport.asn.sent, which is what triggers workflowService's
+     * packing/grading orchestration, so that now correctly fires on real
+     * pickup instead of at booking.
+     */
+    private void sendAsnOnPickup(TransportShipment ts) {
+        if (ts.getRtsId() == null) return;
+        List<AdvancedShipmentNotice> draftAsns = asnRepository.findByRtsId(ts.getRtsId()).stream()
+                .filter(a -> a.getStatus() == AsnStatus.DRAFT)
+                .toList();
+        for (AdvancedShipmentNotice asn : draftAsns) {
+            asn.setStatus(AsnStatus.SENT);
+            asn.setSentAt(java.time.LocalDateTime.now());
+            asnRepository.save(asn);
+            kafkaProducer.publishAsnSent(asn.getAsnId(), java.util.Map.of("asnId", asn.getAsnId(), "rtsId", ts.getRtsId()));
+        }
+        rtsRepository.findById(ts.getRtsId()).ifPresent(rts -> {
+            rts.setAsnSent(true);
+            rts.setAsnSentAt(java.time.LocalDateTime.now());
+            rtsRepository.save(rts);
+        });
+    }
 
     private TransportShipment findShipment(String tsId) {
         return shipmentRepository.findById(tsId)

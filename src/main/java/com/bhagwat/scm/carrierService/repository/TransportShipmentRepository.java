@@ -13,4 +13,5 @@ public interface TransportShipmentRepository extends JpaRepository<TransportShip
     List<TransportShipment> findByTransportPlanId(String planId);
     List<TransportShipment> findByCarrierIdAndStatus(String carrierId, TransportShipmentStatus status);
     List<TransportShipment> findByVehicleId(String vehicleId);
+    List<TransportShipment> findByRtsId(String rtsId);
 }

@@ -114,13 +114,39 @@ public class TransportShipmentService {
     // ── Plan assignment (called by Kafka consumer) ────────────────────────────
 
     /**
-     * Creates a TransportShipment from a TransportOrder received via Kafka.
-     * This is the bridge between planning (transportPlanner) and execution (carrierService).
+     * Creates (or, if one was already made eagerly at RTS-booking time via
+     * TransportRequestService.createRts(), updates in place) a
+     * TransportShipment from a TransportOrder received via Kafka. This is
+     * the bridge between planning (transportPlanner) and execution
+     * (carrierService) — the same rtsId-based reconciliation
+     * TransportPlanConsumer/assignTransportPlanByRtsId already does for the
+     * plan-assignment step, extended to cover this, the actual duplicate:
+     * createRts() and this method used to each unconditionally create their
+     * own TransportShipment for the same RTS.
      */
     @Transactional
     public String createFromTransportOrder(String toId, String toNumber, String planId,
                                             String carrierId, String vehicleId, String vehicleNumber,
                                             String driverName, java.util.Map<String, Object> event) {
+        String rtsId = (String) event.get("rtsId");
+        if (rtsId != null) {
+            List<TransportShipment> existing = shipmentRepository.findByRtsId(rtsId);
+            if (!existing.isEmpty()) {
+                TransportShipment ts = existing.get(0);
+                ts.setTransportPlanId(planId);
+                ts.setTransportPlanNumber((String) event.get("planNumber"));
+                ts.setCarrierId(carrierId);
+                ts.setCarrierName((String) event.get("carrierName"));
+                ts.setVehicleId(vehicleId);
+                ts.setVehicleNumber(vehicleNumber);
+                ts.setDriverName(driverName);
+                ts.setDriverPhone((String) event.get("driverPhone"));
+                shipmentRepository.save(ts);
+                ensureConsignment(ts, event);
+                return ts.getTsId();
+            }
+        }
+
         String tsNumber = "TS-" + java.util.UUID.randomUUID().toString().substring(0, 8).toUpperCase();
 
         // Extract locations from event
@@ -150,12 +176,24 @@ public class TransportShipmentService {
                 .build();
 
         TransportShipment saved = shipmentRepository.save(ts);
+        ensureConsignment(saved, event);
+        return saved.getTsId();
+    }
 
-        // Every shipment has at least one destination-level consignment. The live
-        // transport-planning path only ever produces DIRECT plans today (single
-        // origin, single destination), so one consignment per shipment matches
-        // actual current behavior; SOURCE/DEST_CONSOLIDATION would add more here
-        // once the planner's plan-type selection is wired into the live path.
+    /**
+     * Every shipment has at least one destination-level consignment. The live
+     * transport-planning path only ever produces DIRECT plans today (single
+     * origin, single destination), so one consignment per shipment matches
+     * actual current behavior; SOURCE/DEST_CONSOLIDATION would add more here
+     * once the planner's plan-type selection is wired into the live path.
+     * No-ops if this shipment already has one — relevant when reconciling
+     * into a shipment that createRts() already created eagerly.
+     */
+    private void ensureConsignment(TransportShipment saved, java.util.Map<String, Object> event) {
+        if (!consignmentRepository.findByTransportShipmentId(saved.getTsId()).isEmpty()) {
+            return;
+        }
+        LocationAddress dest = saved.getDestinationAddress();
         Consignment consignment = Consignment.builder()
                 .transportShipmentId(saved.getTsId())
                 .orderId((String) event.get("orderId"))
@@ -168,8 +206,6 @@ public class TransportShipmentService {
                 .totalWeightKg(saved.getTotalWeightKg())
                 .build();
         consignmentRepository.save(consignment);
-
-        return saved.getTsId();
     }
 
     private LocationAddress extractAddress(java.util.Map<String, Object> event, String prefix) {
@@ -193,18 +229,11 @@ public class TransportShipmentService {
 
     @Transactional
     public void assignTransportPlanByRtsId(String rtsId, String transportPlanId, String transportPlanNumber) {
-        List<TransportShipment> shipments = shipmentRepository.findByTransportPlanId(rtsId);
-        // fallback: find by rtsId match in the table (rtsId field)
-        List<TransportShipment> all = shipmentRepository.findAll().stream()
-                .filter(ts -> rtsId.equals(ts.getRtsId()))
-                .collect(Collectors.toList());
-        if (!all.isEmpty()) {
-            all.forEach(ts -> {
-                ts.setTransportPlanId(transportPlanId);
-                ts.setTransportPlanNumber(transportPlanNumber);
-                shipmentRepository.save(ts);
-            });
-        }
+        shipmentRepository.findByRtsId(rtsId).forEach(ts -> {
+            ts.setTransportPlanId(transportPlanId);
+            ts.setTransportPlanNumber(transportPlanNumber);
+            shipmentRepository.save(ts);
+        });
     }
 
     // ── Vehicle assignment ────────────────────────────────────────────────────

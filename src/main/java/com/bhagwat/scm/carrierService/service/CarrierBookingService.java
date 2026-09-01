@@ -122,6 +122,20 @@ public class CarrierBookingService {
                 .orElseThrow(() -> new RuntimeException("Response not found: " + req.getCbrRespId()));
         CarrierBookingRequest cbr = findCbr(cbrId);
 
+        // This flow and the automatic one (ShippingOrderReadyConsumer) are two
+        // independent ways a TransportRequest gets created for the same
+        // shipping order — guard against booking the same one twice rather
+        // than silently creating a duplicate TR (and, downstream, a duplicate
+        // shipment) for it.
+        if (req.getShippingOrderId() != null && !req.getShippingOrderId().isBlank()) {
+            List<TransportRequest> existing = trRepo.findByShippingOrderId(req.getShippingOrderId());
+            if (!existing.isEmpty()) {
+                throw new RuntimeException("Shipping order " + req.getShippingOrderId()
+                        + " already has a transport request (trId=" + existing.get(0).getTrId()
+                        + ") — it may already be booked via the automatic carrier-selection flow.");
+            }
+        }
+
         resp.setStatus(CbrRespStatus.ACCEPTED_BY_SHIPPER);
         respRepo.save(resp);
         cbr.setStatus(CbrStatus.ACCEPTED);

@@ -11,4 +11,5 @@ public interface TransportRequestRepository extends JpaRepository<TransportReque
     List<TransportRequest> findByStatus(TransportRequestStatus status);
     Optional<TransportRequest> findByTrNumber(String trNumber);
     List<TransportRequest> findByRequestedByPartyId(String partyId);
+    List<TransportRequest> findByShippingOrderId(String shippingOrderId);
 }

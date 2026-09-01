@@ -1,9 +1,12 @@
 package com.bhagwat.scm.carrierService.kafka;
 
+import com.bhagwat.scm.carrierService.dto.CbrRequest;
+import com.bhagwat.scm.carrierService.dto.CbrResponse;
+import com.bhagwat.scm.carrierService.dto.LocationAddressDto;
 import com.bhagwat.scm.carrierService.entity.*;
 import com.bhagwat.scm.carrierService.enums.*;
 import com.bhagwat.scm.carrierService.repository.*;
-import com.bhagwat.scm.carrierService.service.VolumetricService;
+import com.bhagwat.scm.carrierService.service.CarrierBookingService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.kafka.annotation.KafkaListener;
@@ -13,18 +16,25 @@ import org.springframework.transaction.annotation.Transactional;
 import java.math.BigDecimal;
 import java.time.LocalDate;
 import java.time.LocalDateTime;
-import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
  * Consumes shipping-order.ready events from whichever service originated
- * them — sellerService, wmsService, or storeService. Creates
- * TransportRequest → ReadyToShipOrder → publishes RTS event for
- * transportPlanner, identically regardless of origin.
+ * them — sellerService, wmsService, or storeService. Creates a
+ * ReadyToShipOrder plus a CarrierBookingRequest and publishes an RTS event
+ * for transportPlanner once a carrier is actually selected, identically
+ * regardless of origin.
  *
  * Flow: seller/warehouse/store marks something READY → this consumer →
- * TR + RTS created → Kafka → transportPlanner auto-plans
+ * RTS + CBR created (DRAFT, not yet broadcast) → an operator broadcasts the
+ * CBR to eligible carriers via CarrierBookingController → carriers respond →
+ * shipper accepts via SellerCarrierSelectionController, which delegates to
+ * CarrierBookingService.acceptResponse() — the single place a
+ * TransportRequest gets created, whether the booking started here or via
+ * the formal CBR REST API directly. That convergence is what removed the
+ * previous eager, disconnected TransportRequest creation that used to live
+ * in this consumer and could race with the formal flow's own TR creation.
  *
  * requestedByPartyType/requestedByPartyId identify the origin. Falls back to
  * SELLER + the legacy "sellerId" key for events published before these two
@@ -35,12 +45,9 @@ import java.util.Map;
 @Slf4j
 public class ShippingOrderReadyConsumer {
 
-    private final TransportRequestRepository trRepo;
-    private final TransportRequestItemRepository trItemRepo;
     private final ReadyToShipOrderRepository rtsRepo;
     private final ReadyToShipItemRepository rtsItemRepo;
-    private final CarrierKafkaProducer kafkaProducer;
-    private final VolumetricService volumetricService;
+    private final CarrierBookingService bookingService;
 
     @KafkaListener(topics = "transport.shipping-order.ready", groupId = "carrier-service")
     @Transactional
@@ -63,58 +70,24 @@ public class ShippingOrderReadyConsumer {
 
             log.info("Processing shipping-order.ready: soId={} requestedBy={}:{}", soId, requestedByPartyType, requestedByPartyId);
 
-            // 1. Create TransportRequest
-            TransportRequest tr = TransportRequest.builder()
-                    .trNumber("TR-" + soId.substring(0, 8).toUpperCase())
-                    .shippingOrderId(soId)
-                    .shippingOrderNumber(soId)
-                    .requestedByPartyId(requestedByPartyId)
-                    .requestedByPartyType(requestedByPartyType)
-                    .requestedByPartyName(requestedByPartyId)
-                    .shipmentType(mapShipmentType(type))
-                    .originAddress(LocationAddress.builder()
-                            .locationId(sourceId)
-                            .city(sourceId)
-                            .build())
-                    .destinationAddress(LocationAddress.builder()
-                            .locationId(destName)
-                            .street(destAddress)
-                            .city(destName)
-                            .build())
-                    .requestedDeliveryDate(expectedDateStr != null ? LocalDate.parse(expectedDateStr) : null)
-                    .loadType(LoadType.LTL)
-                    .status(TransportRequestStatus.PENDING)
-                    .build();
-            tr = trRepo.save(tr);
+            ShipmentType shipmentType = mapShipmentType(type);
+            LocationAddress origin = LocationAddress.builder().locationId(sourceId).city(sourceId).build();
+            LocationAddress destination = LocationAddress.builder()
+                    .locationId(destName).street(destAddress).city(destName).build();
+            LocalDate deliveryDate = expectedDateStr != null ? LocalDate.parse(expectedDateStr) : null;
 
-            // Save items
-            List<?> items = (List<?>) event.get("items");
-            if (items != null) {
-                for (Object item : items) {
-                    @SuppressWarnings("unchecked")
-                    Map<String, Object> itemMap = (Map<String, Object>) item;
-                    TransportRequestItem tri = TransportRequestItem.builder()
-                            .trId(tr.getTrId())
-                            .skuId((String) itemMap.get("skuId"))
-                            .productName((String) itemMap.get("productName"))
-                            .quantity(new BigDecimal(itemMap.getOrDefault("quantity", "0").toString()))
-                            .build();
-                    trItemRepo.save(tri);
-                }
-            }
-
-            // 2. Create ReadyToShipOrder from TR
+            // 1. Create ReadyToShipOrder — no carrier chosen yet
             ReadyToShipOrder rts = ReadyToShipOrder.builder()
                     .rtsNumber("RTS-" + soId.substring(0, 8).toUpperCase())
-                    .trId(tr.getTrId())
-                    .shipmentType(tr.getShipmentType())
+                    .soId(soId)
+                    .shipmentType(shipmentType)
                     .shipper(ShipmentParty.builder()
                             .partyId(requestedByPartyId)
                             .partyName(requestedByPartyId)
                             .partyType(requestedByPartyType)
                             .build())
-                    .originAddress(tr.getOriginAddress())
-                    .destinationAddress(tr.getDestinationAddress())
+                    .originAddress(origin)
+                    .destinationAddress(destination)
                     .cargoReadyDateTime(LocalDateTime.now())
                     .loadType(LoadType.LTL)
                     .status(RtsStatus.READY)
@@ -126,6 +99,7 @@ public class ShippingOrderReadyConsumer {
             BigDecimal totalVolumeM3 = BigDecimal.ZERO;
             int totalPackages = 0;
 
+            List<?> items = (List<?>) event.get("items");
             if (items != null) {
                 for (Object item : items) {
                     @SuppressWarnings("unchecked")
@@ -158,39 +132,49 @@ public class ShippingOrderReadyConsumer {
                 }
             }
 
-            // Update RTS with calculated volumetrics
             if (totalWeightKg.compareTo(BigDecimal.ZERO) > 0) {
                 rts.setTotalWeightKg(totalWeightKg);
                 rts.setTotalVolumeM3(totalVolumeM3);
                 rts.setTotalPackages(totalPackages);
-                rtsRepo.save(rts);
-
-                // Also update TR
-                tr.setTotalWeightKg(totalWeightKg);
-                tr.setTotalVolumeM3(totalVolumeM3);
-                tr.setTotalPackages(totalPackages);
-                trRepo.save(tr);
             }
 
-            // 3. Broadcast CBR to eligible carriers (requester will choose from responses)
-            kafkaProducer.publishCbrBroadcast(rts.getRtsId(), Map.of(
-                    "rtsId", rts.getRtsId(),
-                    "rtsNumber", rts.getRtsNumber(),
-                    "trId", tr.getTrId(),
-                    "requestedByPartyType", requestedByPartyType,
-                    "requestedByPartyId", requestedByPartyId,
-                    "soId", soId,
-                    "originCity", sourceId != null ? sourceId : "",
-                    "destinationCity", destName != null ? destName : "",
-                    "status", "AWAITING_CARRIER_SELECTION"
-            ));
+            // 2. Create the Carrier Booking Request — the same entity the formal
+            // /api/v1/carrier/bookings API creates. Left DRAFT: broadcasting to
+            // specific carriers and the shipper's eventual selection both go
+            // through the existing CBR machinery from here on, instead of a
+            // separate ad-hoc path.
+            CbrResponse cbr = bookingService.createCbr(CbrRequest.builder()
+                    .requestedByPartyId(requestedByPartyId)
+                    .requestedByPartyType(requestedByPartyType)
+                    .requestedByPartyName(requestedByPartyId)
+                    .shipmentType(shipmentType)
+                    .originAddress(toAddrDto(origin))
+                    .destinationAddress(toAddrDto(destination))
+                    .requestedDeliveryDate(deliveryDate)
+                    .loadType(LoadType.LTL)
+                    .totalWeightKg(rts.getTotalWeightKg())
+                    .totalVolumeM3(rts.getTotalVolumeM3())
+                    .totalPackages(rts.getTotalPackages())
+                    .build());
 
-            log.info("Created TR={} RTS={} for shipping order {}. Awaiting carrier selection by {}.",
-                    tr.getTrNumber(), rts.getRtsNumber(), soId, requestedByPartyType);
+            rts.setCbrId(cbr.getCbrId());
+            rtsRepo.save(rts);
+
+            log.info("Created RTS={} and CBR={} for shipping order {}. Awaiting broadcast/carrier selection.",
+                    rts.getRtsNumber(), cbr.getCbrNumber(), soId);
 
         } catch (Exception e) {
             log.error("Error processing shipping-order.ready: {}", e.getMessage(), e);
         }
+    }
+
+    private LocationAddressDto toAddrDto(LocationAddress a) {
+        if (a == null) return null;
+        return LocationAddressDto.builder()
+                .locationId(a.getLocationId()).street(a.getStreet())
+                .city(a.getCity()).state(a.getState())
+                .pincode(a.getPincode()).country(a.getCountry())
+                .build();
     }
 
     private ShipmentType mapShipmentType(String type) {

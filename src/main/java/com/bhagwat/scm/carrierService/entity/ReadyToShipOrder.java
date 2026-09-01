@@ -16,6 +16,10 @@ public class ReadyToShipOrder {
     @Column(name = "rts_number", unique = true, nullable = false, length = 30)
     private String rtsNumber;
 
+    /** Originating shipping order id — set at RTS creation, before a TransportRequest exists. */
+    @Column(name = "so_id", length = 100)
+    private String soId;
+
     @Column(name = "tr_id", length = 100)
     private String trId;
 

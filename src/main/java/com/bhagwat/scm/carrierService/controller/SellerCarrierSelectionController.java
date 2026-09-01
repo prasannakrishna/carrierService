@@ -1,10 +1,13 @@
 package com.bhagwat.scm.carrierService.controller;
 
 import com.bhagwat.scm.carrierService.client.ContractManagerClient;
+import com.bhagwat.scm.carrierService.dto.AcceptCbrResponseRequest;
+import com.bhagwat.scm.carrierService.dto.TransportRequestResponse;
 import com.bhagwat.scm.carrierService.entity.*;
 import com.bhagwat.scm.carrierService.enums.*;
 import com.bhagwat.scm.carrierService.kafka.CarrierKafkaProducer;
 import com.bhagwat.scm.carrierService.repository.*;
+import com.bhagwat.scm.carrierService.service.CarrierBookingService;
 import lombok.Data;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.ResponseEntity;
@@ -24,8 +27,8 @@ import java.util.Map;
 public class SellerCarrierSelectionController {
 
     private final ReadyToShipOrderRepository rtsRepo;
-    private final CarrierBookingRequestRepository cbrRepo;
     private final CarrierBookingResponseRepository cbrRespRepo;
+    private final CarrierBookingService bookingService;
     private final CarrierKafkaProducer kafkaProducer;
     private final ContractManagerClient contractClient;
 
@@ -48,20 +51,13 @@ public class SellerCarrierSelectionController {
      */
     @GetMapping("/responses/{rtsId}")
     public ResponseEntity<List<Map<String, Object>>> getCarrierResponses(@PathVariable String rtsId) {
-        // Find CBR for this RTS
-        List<CarrierBookingRequest> cbrs = cbrRepo.findAll().stream()
-                .filter(c -> rtsId.equals(c.getCbrId()))
-                .toList();
-        if (cbrs.isEmpty()) return ResponseEntity.ok(List.of());
+        // Find the CBR actually tied to this RTS (set when the RTS was created)
+        ReadyToShipOrder rts = rtsRepo.findById(rtsId).orElse(null);
+        if (rts == null || rts.getCbrId() == null) return ResponseEntity.ok(List.of());
 
-        // Get seller ID from RTS
-        String sellerId = rtsRepo.findById(rtsId)
-                .map(r -> r.getShipper() != null ? r.getShipper().getPartyId() : null)
-                .orElse(null);
+        String sellerId = rts.getShipper() != null ? rts.getShipper().getPartyId() : null;
 
-        List<CarrierBookingResponse> responses = cbrs.stream()
-                .flatMap(c -> cbrRespRepo.findByCbrId(c.getCbrId()).stream())
-                .toList();
+        List<CarrierBookingResponse> responses = cbrRespRepo.findByCbrId(rts.getCbrId());
 
         // Enrich each response with contract terms
         List<Map<String, Object>> enriched = responses.stream().map(resp -> {
@@ -105,42 +101,39 @@ public class SellerCarrierSelectionController {
 
     /**
      * Seller selects a carrier from the responses.
+     * Delegates to CarrierBookingService.acceptResponse() — the same method the
+     * formal CarrierBookingController REST API uses — so this is the single place
+     * a TransportRequest gets created (and the double-booking guard there applies
+     * here too), instead of a separate ad-hoc path.
      * This triggers: RTS assigned → Kafka rts.created → transportPlanner creates plan → execution begins.
      */
     @PostMapping("/select")
     public ResponseEntity<Map<String, String>> selectCarrier(@RequestBody CarrierSelectionRequest req) {
         ReadyToShipOrder rts = rtsRepo.findById(req.getRtsId())
                 .orElseThrow(() -> new IllegalArgumentException("RTS not found: " + req.getRtsId()));
+        if (rts.getCbrId() == null) {
+            throw new IllegalStateException("RTS " + req.getRtsId() + " has no associated carrier booking request");
+        }
 
-        // Assign selected carrier to RTS
-        rts.setCarrierId(req.getCarrierId());
-        rts.setCarrierName(req.getCarrierName());
-        rts.setCbrId(req.getCbrResponseId());
+        TransportRequestResponse tr = bookingService.acceptResponse(rts.getCbrId(), AcceptCbrResponseRequest.builder()
+                .cbrRespId(req.getCbrResponseId())
+                .shippingOrderId(rts.getSoId())
+                .shippingOrderNumber(rts.getSoId())
+                .build());
+
+        rts.setCarrierId(tr.getCarrierId());
+        rts.setCarrierName(tr.getCarrierName());
+        rts.setTrId(tr.getTrId());
         rts.setStatus(RtsStatus.BOOKED);
         rtsRepo.save(rts);
-
-        // Decline all other responses for this RTS
-        List<CarrierBookingRequest> cbrs = cbrRepo.findAll().stream()
-                .filter(c -> req.getRtsId().equals(c.getCbrId())).toList();
-        for (CarrierBookingRequest cbr : cbrs) {
-            cbrRespRepo.findByCbrId(cbr.getCbrId()).forEach(resp -> {
-                if (!resp.getCarrierId().equals(req.getCarrierId())) {
-                    resp.setStatus(com.bhagwat.scm.carrierService.enums.CbrRespStatus.DECLINED);
-                    cbrRespRepo.save(resp);
-                } else {
-                    resp.setStatus(com.bhagwat.scm.carrierService.enums.CbrRespStatus.ACCEPTED);
-                    cbrRespRepo.save(resp);
-                }
-            });
-        }
 
         // NOW trigger the transport planning flow
         kafkaProducer.publishRtsCreated(rts.getRtsId(), Map.of(
                 "rtsId", rts.getRtsId(),
                 "rtsNumber", rts.getRtsNumber(),
                 "trId", rts.getTrId() != null ? rts.getTrId() : "",
-                "carrierId", req.getCarrierId(),
-                "carrierName", req.getCarrierName() != null ? req.getCarrierName() : "",
+                "carrierId", tr.getCarrierId(),
+                "carrierName", tr.getCarrierName() != null ? tr.getCarrierName() : "",
                 "sellerId", rts.getShipper() != null ? rts.getShipper().getPartyId() : "",
                 "originCity", rts.getOriginAddress() != null ? rts.getOriginAddress().getCity() : "",
                 "destinationCity", rts.getDestinationAddress() != null ? rts.getDestinationAddress().getCity() : ""
@@ -148,7 +141,7 @@ public class SellerCarrierSelectionController {
 
         return ResponseEntity.ok(Map.of(
                 "rtsId", rts.getRtsId(),
-                "carrierId", req.getCarrierId(),
+                "carrierId", tr.getCarrierId(),
                 "status", "BOOKED",
                 "message", "Carrier selected. Transport plan will be created automatically."
         ));

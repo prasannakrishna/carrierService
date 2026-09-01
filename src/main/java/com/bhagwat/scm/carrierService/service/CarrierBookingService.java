@@ -141,6 +141,13 @@ public class CarrierBookingService {
         cbr.setStatus(CbrStatus.ACCEPTED);
         cbrRepo.save(cbr);
 
+        // Decline every other response to this CBR now that one has been accepted —
+        // centralized here so every caller (formal CBR flow and the automatic
+        // seller-selection flow) gets this behavior instead of each reimplementing it.
+        respRepo.findByCbrId(cbrId).stream()
+                .filter(r -> !r.getCbrRespId().equals(resp.getCbrRespId()))
+                .forEach(r -> { r.setStatus(CbrRespStatus.DECLINED); respRepo.save(r); });
+
         TransportRequest tr = TransportRequest.builder()
                 .trNumber(trNumber())
                 .cbrId(cbrId)

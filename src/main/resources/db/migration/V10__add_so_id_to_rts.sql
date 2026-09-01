@@ -1,0 +1,1 @@
+ALTER TABLE ready_to_ship_orders ADD COLUMN IF NOT EXISTS so_id VARCHAR(100);

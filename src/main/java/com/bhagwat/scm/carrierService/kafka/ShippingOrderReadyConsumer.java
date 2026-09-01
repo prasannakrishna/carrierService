@@ -18,10 +18,17 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * Consumes shipping-order.ready events from sellerService.
- * Creates TransportRequest → ReadyToShipOrder → publishes RTS event for transportPlanner.
+ * Consumes shipping-order.ready events from whichever service originated
+ * them — sellerService, wmsService, or storeService. Creates
+ * TransportRequest → ReadyToShipOrder → publishes RTS event for
+ * transportPlanner, identically regardless of origin.
  *
- * Flow: Seller marks SO as READY → this consumer → TR + RTS created → Kafka → transportPlanner auto-plans
+ * Flow: seller/warehouse/store marks something READY → this consumer →
+ * TR + RTS created → Kafka → transportPlanner auto-plans
+ *
+ * requestedByPartyType/requestedByPartyId identify the origin. Falls back to
+ * SELLER + the legacy "sellerId" key for events published before these two
+ * fields existed (sellerService's own producer still only sets "sellerId").
  */
 @Component
 @RequiredArgsConstructor
@@ -40,28 +47,30 @@ public class ShippingOrderReadyConsumer {
     public void onShippingOrderReady(Map<String, Object> event) {
         try {
             String soId = (String) event.get("soId");
-            String sellerId = (String) event.get("sellerId");
+            String requestedByPartyId = (String) event.get("requestedByPartyId");
+            if (requestedByPartyId == null) requestedByPartyId = (String) event.get("sellerId");
+            String requestedByPartyType = (String) event.getOrDefault("requestedByPartyType", "SELLER");
             String sourceId = (String) event.get("sourceId");
             String destName = (String) event.get("destinationName");
             String destAddress = (String) event.get("destinationAddress");
             String expectedDateStr = (String) event.get("expectedDate");
             String type = (String) event.get("type");
 
-            if (soId == null || sellerId == null) {
-                log.warn("Ignoring shipping-order.ready with missing soId/sellerId");
+            if (soId == null || requestedByPartyId == null) {
+                log.warn("Ignoring shipping-order.ready with missing soId/requestedByPartyId");
                 return;
             }
 
-            log.info("Processing shipping-order.ready: soId={} seller={}", soId, sellerId);
+            log.info("Processing shipping-order.ready: soId={} requestedBy={}:{}", soId, requestedByPartyType, requestedByPartyId);
 
             // 1. Create TransportRequest
             TransportRequest tr = TransportRequest.builder()
                     .trNumber("TR-" + soId.substring(0, 8).toUpperCase())
                     .shippingOrderId(soId)
                     .shippingOrderNumber(soId)
-                    .requestedByPartyId(sellerId)
-                    .requestedByPartyType("SELLER")
-                    .requestedByPartyName(sellerId)
+                    .requestedByPartyId(requestedByPartyId)
+                    .requestedByPartyType(requestedByPartyType)
+                    .requestedByPartyName(requestedByPartyId)
                     .shipmentType(mapShipmentType(type))
                     .originAddress(LocationAddress.builder()
                             .locationId(sourceId)
@@ -100,9 +109,9 @@ public class ShippingOrderReadyConsumer {
                     .trId(tr.getTrId())
                     .shipmentType(tr.getShipmentType())
                     .shipper(ShipmentParty.builder()
-                            .partyId(sellerId)
-                            .partyName(sellerId)
-                            .partyType("SELLER")
+                            .partyId(requestedByPartyId)
+                            .partyName(requestedByPartyId)
+                            .partyType(requestedByPartyType)
                             .build())
                     .originAddress(tr.getOriginAddress())
                     .destinationAddress(tr.getDestinationAddress())
@@ -163,19 +172,21 @@ public class ShippingOrderReadyConsumer {
                 trRepo.save(tr);
             }
 
-            // 3. Broadcast CBR to eligible carriers (seller will choose from responses)
+            // 3. Broadcast CBR to eligible carriers (requester will choose from responses)
             kafkaProducer.publishCbrBroadcast(rts.getRtsId(), Map.of(
                     "rtsId", rts.getRtsId(),
                     "rtsNumber", rts.getRtsNumber(),
                     "trId", tr.getTrId(),
-                    "sellerId", sellerId,
+                    "requestedByPartyType", requestedByPartyType,
+                    "requestedByPartyId", requestedByPartyId,
                     "soId", soId,
                     "originCity", sourceId != null ? sourceId : "",
                     "destinationCity", destName != null ? destName : "",
                     "status", "AWAITING_CARRIER_SELECTION"
             ));
 
-            log.info("Created TR={} RTS={} for shipping order {}. Awaiting seller carrier selection.", tr.getTrNumber(), rts.getRtsNumber(), soId);
+            log.info("Created TR={} RTS={} for shipping order {}. Awaiting carrier selection by {}.",
+                    tr.getTrNumber(), rts.getRtsNumber(), soId, requestedByPartyType);
 
         } catch (Exception e) {
             log.error("Error processing shipping-order.ready: {}", e.getMessage(), e);
